@@ -66,7 +66,9 @@ The core insight: a general-purpose programming language is the most expressive 
 4. The LLM responds with natural language and fenced `` ```clj `` code blocks.
 5. Each code block is wrapped in `(do ...)` and evaluated in the session namespace. Stdout, stderr, return values, errors, and execution time are captured.
 6. Execution results are appended to the conversation history as user messages, so the LLM sees what happened.
-7. The loop repeats until the LLM calls `(final! x)` to declare its answer, or `max-iterations` is reached.
+7. The loop repeats until the LLM calls `(final! x)` to declare its answer, `max-iterations` is reached, or a timeout/error limit is hit.
+8. If iterations exhaust without `final!`, one last LLM call asks for a default answer.
+9. Each iteration includes a per-iteration user prompt that nudges the LLM to use the REPL (iteration 0 gets a safeguard preventing premature answers).
 
 ### What the LLM sees inside the REPL
 
@@ -79,9 +81,13 @@ When code runs inside a session, these symbols are available:
 | `final!` | `(final! x)` — stores `x` as the answer and stops the loop |
 | `show-vars` | `(show-vars)` — lists user-defined vars in the session (excludes reserved names and `-`-prefixed) |
 | `llm-query` | `(llm-query prompt)` or `(llm-query prompt model)` — single-turn LLM call, returns a string |
+| `llm-query-batched` | `(llm-query-batched prompts)` or `(llm-query-batched prompts model)` — concurrent `llm-query` over a vector of prompts, returns a vector of strings |
 | `rlm-query` | `(rlm-query prompt)` or `(rlm-query prompt model)` — spawns a **child RLM session** recursively |
+| `rlm-query-batched` | `(rlm-query-batched prompts)` or `(rlm-query-batched prompts model)` — concurrent `rlm-query` over a vector of prompts |
 | Custom tools | Any functions passed via the `:tools` option |
 | `clojure.core` | The full standard library is referred into the session namespace |
+
+All reserved symbols are protected by **scaffold restoration** — if the LLM's code accidentally overwrites `context`, `llm-query`, etc., they are automatically re-interned after each execution.
 
 The LLM can also `def` new vars, `defn` functions, `require` libraries — it has a real Clojure namespace.
 
@@ -112,6 +118,26 @@ Each session gets its own namespace (`rlm.session.<uuid>`). This means:
 - Sessions can run concurrently without interference.
 - `close-session!` removes the namespace entirely, cleaning up all vars.
 - The close function is idempotent and guards against removing unrelated namespaces (the ns stored in the atom must match the session ns).
+
+### Iteration-aware prompting
+
+Each iteration includes a structured user prompt that guides the LLM:
+
+- **Iteration 0** gets a safeguard: *"You have not interacted with the REPL yet. Examine the context first."* This prevents the LLM from guessing an answer without using the REPL.
+- **Subsequent iterations** get: *"The history above shows your previous REPL interactions. Continue..."*
+- If `:root-prompt` is set, it's repeated each iteration so the LLM doesn't lose sight of the original task.
+
+### Compaction
+
+For long-running sessions, history can grow beyond the LLM's context window. With `:compaction true`, the runtime monitors total message size. When it exceeds `:compaction-threshold` (default 100K chars), it asks the LLM to summarize its progress, then replaces the history with the summary. The REPL namespace is preserved — all `def`'d vars survive compaction.
+
+### Safety features
+
+- **Scaffold restoration:** After each code block executes, all reserved vars (`context`, `final!`, `llm-query`, etc.) are re-interned from the original values. The LLM cannot permanently shadow them.
+- **Output truncation:** Execution results are capped at 20,000 characters to prevent context window blowout.
+- **Timeout:** `:max-timeout` (seconds) stops the loop if wall-clock time is exceeded.
+- **Error cap:** `:max-errors` stops the loop after N consecutive code execution errors.
+- **Default answer:** When iterations exhaust without `final!`, one final LLM call asks for the best answer given the conversation so far.
 
 ## The `:llm-fn` contract
 
@@ -260,8 +286,13 @@ Each LLM turn produces an `"assistant"` message. Each executed code block produc
 | `:max-depth` | `1` | Maximum recursion depth for `rlm-query`. `1` = no child sessions. |
 | `:depth` | `0` | Current depth (set automatically for child sessions) |
 | `:model` | `nil` | Passed through to `:llm-fn` |
-| `:system-prompt` | Built-in prompt | System message instructing the LLM to use code blocks and `final!` |
+| `:system-prompt` | Built-in prompt | Comprehensive prompt with function docs, examples, and strategy guidance |
 | `:tools` | `{}` | Map of `symbol-or-keyword -> function` to inject into the session |
+| `:max-timeout` | `nil` | Wall-clock timeout in seconds. `nil` = no limit. |
+| `:max-errors` | `nil` | Max consecutive code execution errors before stopping. `nil` = no limit. |
+| `:compaction` | `false` | Enable history compaction when context grows large |
+| `:compaction-threshold` | `100000` | Character count threshold to trigger compaction |
+| `:root-prompt` | `nil` | *(completion opt)* Reminder prompt shown to the LLM each iteration |
 
 ## OpenRouter adapter
 
@@ -334,7 +365,8 @@ clojure -M:test
 
 ```
 deps.edn                   — tools.deps config (one dep: data.json)
-src/rlm/minimal.clj        — core runtime (~315 lines)
+src/rlm/prompts.clj        — system prompt, iteration prompts, context metadata (~100 lines)
+src/rlm/minimal.clj        — core runtime (~490 lines)
 src/rlm/openrouter.clj     — OpenRouter LLM adapter (~60 lines)
 test/rlm/minimal_test.clj  — unit test suite (~460 lines)
 docs/                       — design spec and implementation plan

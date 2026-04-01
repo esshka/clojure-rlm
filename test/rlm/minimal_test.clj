@@ -101,7 +101,7 @@
                                {:llm-fn (fn [{:keys [prompt]}]
                                           (when-not (string? prompt)
                                             (throw (ex-info "Prompt should be a string." {})))
-                                          prompt)})
+                                          "```clj\n(final! (pr-str context))\n```")})
             result (completion-var session)]
         (try
           (is (= "{:answer 42}" (:response result)))
@@ -453,6 +453,203 @@
           (is (= "cap|1" (:value (eval-var session "(rlm-query \"cap\")"))))
           (finally
             (close-var session)))))))
+
+;; ── scaffold restoration ─────────────────────────────────────
+
+(deftest scaffold-restores-context-after-overwrite
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {exec-var :var} (resolve-var 'rlm.minimal/exec-code!)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var {:original true} {:llm-fn (constantly "")})]
+      (try
+        (exec-var session "(def context \"overwritten\")")
+        (let [ctx (:value (eval-var session "context"))]
+          (is (= {:original true} ctx)))
+        (finally
+          (close-var session))))))
+
+(deftest scaffold-restores-final-after-overwrite
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {exec-var :var} (resolve-var 'rlm.minimal/exec-code!)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil {:llm-fn (constantly "")})]
+      (try
+        (exec-var session "(def final! 42)")
+        (let [f (:value (eval-var session "(fn? final!)"))]
+          (is (true? f)))
+        (finally
+          (close-var session))))))
+
+;; ── output truncation ───────────────────────────────────────
+
+(deftest summarize-result-truncates-long-output
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {exec-var :var} (resolve-var 'rlm.minimal/exec-code!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)]
+    (let [session (start-var nil
+                             {:llm-fn (fn [_]
+                                        "```clj\n(final! (apply str (repeat 30000 \"x\")))\n```")
+                              :max-iterations 2})
+          result (completion-var session)
+          history (:history @(:state session))
+          exec-msg (:content (second history))]
+      (try
+        (is (< (count exec-msg) 25000))
+        (is (str/includes? exec-msg "chars truncated"))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── default-answer fallback ─────────────────────────────────
+
+(deftest completion-uses-default-answer-when-iterations-exhaust
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [calls (atom 0)
+          session (start-var "test"
+                             {:llm-fn (fn [_]
+                                        (let [n (swap! calls inc)]
+                                          (if (<= n 2)
+                                            "I'm thinking..."
+                                            "The answer is 99.")))
+                              :max-iterations 2})
+          result (completion-var session)]
+      (try
+        ;; 2 iterations of "thinking" + 1 default-answer call = 3 total
+        (is (= 3 @calls))
+        (is (= "The answer is 99." (:response result)))
+        (is (= 2 (:iterations result)))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── timeout ─────────────────────────────────────────────────
+
+(deftest completion-stops-on-timeout
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil
+                             {:llm-fn (fn [_]
+                                        (Thread/sleep 200)
+                                        "still thinking")
+                              :max-iterations 100
+                              :max-timeout 0.3})
+          result (completion-var session)]
+      (try
+        (is (< (:iterations result) 100))
+        (is (string? (:response result)))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── max errors ──────────────────────────────────────────────
+
+(deftest completion-stops-on-consecutive-errors
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil
+                             {:llm-fn (fn [_]
+                                        "```clj\n(/ 1 0)\n```")
+                              :max-iterations 20
+                              :max-errors 3})
+          result (completion-var session)]
+      (try
+        (is (= 3 (:iterations result)))
+        (is (string? (:response result)))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── batched queries ─────────────────────────────────────────
+
+(deftest llm-query-batched-returns-vector-of-results
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil {:llm-fn (fn [{:keys [prompt]}]
+                                            (str "echo:" prompt))
+                                  :max-depth 1})]
+      (try
+        (let [result (:value (eval-var session
+                               "(llm-query-batched [\"a\" \"b\" \"c\"])"))]
+          (is (vector? result))
+          (is (= 3 (count result)))
+          (is (every? #(str/starts-with? % "echo:") result)))
+        (finally
+          (close-var session))))))
+
+(deftest rlm-query-batched-falls-back-at-depth-cap
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil {:llm-fn (fn [{:keys [prompt depth]}]
+                                            (str prompt "|" depth))
+                                  :depth 1
+                                  :max-depth 2})]
+      (try
+        (let [result (:value (eval-var session
+                               "(rlm-query-batched [\"x\" \"y\"])"))]
+          (is (vector? result))
+          (is (= 2 (count result)))
+          (is (= "x|1" (first result)))
+          (is (= "y|1" (second result))))
+        (finally
+          (close-var session))))))
+
+;; ── no-code-block continuation ──────────────────────────────
+
+(deftest completion-continues-loop-when-no-code-blocks
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [calls (atom 0)
+          session (start-var nil
+                             {:llm-fn (fn [_]
+                                        (let [n (swap! calls inc)]
+                                          (if (< n 3)
+                                            "Let me think about this..."
+                                            "```clj\n(final! :got-it)\n```")))
+                              :max-iterations 5})
+          result (completion-var session)]
+      (try
+        (is (= ":got-it" (:response result)))
+        (is (= 3 (:iterations result)))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── root-prompt ─────────────────────────────────────────────
+
+(deftest completion-passes-root-prompt-to-llm
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [seen-messages (atom [])
+          session (start-var nil
+                             {:llm-fn (fn [{:keys [messages]}]
+                                        (reset! seen-messages messages)
+                                        "```clj\n(final! :ok)\n```")})
+          result (completion-var session {:root-prompt "Find the answer"})]
+      (try
+        (is (= ":ok" (:response result)))
+        (let [last-user (->> @seen-messages
+                             (filter #(= "user" (:role %)))
+                             last
+                             :content)]
+          (is (str/includes? last-user "Find the answer")))
+        (finally
+          (close-var (:session result)))))))
+
+;; ── new reserved names ──────────────────────────────────────
+
+(deftest batched-query-names-are-reserved
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Custom tools cannot override reserved names."
+         (start-var nil {:llm-fn (constantly "")
+                         :tools {'llm-query-batched inc}})))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'rlm.minimal-test)]
