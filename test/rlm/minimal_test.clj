@@ -651,6 +651,91 @@
          (start-var nil {:llm-fn (constantly "")
                          :tools {'llm-query-batched inc}})))))
 
+;; ── per-call timeout ────────────────────────────────────────
+
+(deftest call-timeout-aborts-slow-llm-query
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil {:llm-fn (fn [_]
+                                            (Thread/sleep 5000)
+                                            "too slow")
+                                  :call-timeout 0.2})]
+      (try
+        (let [result (eval-var session "(llm-query \"hello\")")]
+          (is (string? (:error result)))
+          (is (str/includes? (:error result) "timed out")))
+        (finally
+          (close-var session))))))
+
+(deftest call-timeout-on-completion-loop-recovers
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {completion-var :var} (resolve-var 'rlm.minimal/completion)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [calls (atom 0)
+          session (start-var nil
+                             {:llm-fn (fn [_]
+                                        (let [n (swap! calls inc)]
+                                          (if (= n 1)
+                                            (do (Thread/sleep 5000) "slow")
+                                            "```clj\n(final! :recovered)\n```")))
+                              :call-timeout 0.2
+                              :max-iterations 5
+                              :max-errors 3})]
+      (try
+        ;; First call times out (treated as error), loop recovers on second call
+        (let [result (completion-var session)]
+          (is (= ":recovered" (:response result)))
+          (is (>= @calls 2)))
+        (finally
+          (close-var (:session session)))))))
+
+;; ── batched concurrency ─────────────────────────────────────
+
+(deftest batched-queries-respect-max-concurrent
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [active (atom 0)
+          max-seen (atom 0)
+          session (start-var nil {:llm-fn (fn [{:keys [prompt]}]
+                                            (swap! active inc)
+                                            (swap! max-seen max @active)
+                                            (Thread/sleep 100)
+                                            (swap! active dec)
+                                            (str "done:" prompt))
+                                  :max-concurrent 2})]
+      (try
+        (let [result (:value (eval-var session
+                               "(llm-query-batched [\"a\" \"b\" \"c\" \"d\"])"))]
+          (is (vector? result))
+          (is (= 4 (count result)))
+          (is (every? #(str/starts-with? % "done:") result))
+          (is (<= @max-seen 2)))
+        (finally
+          (close-var session))))))
+
+(deftest batched-query-handles-individual-timeout
+  (let [{start-var :var} (resolve-var 'rlm.minimal/start-session)
+        {eval-var :var} (resolve-var 'rlm.minimal/eval-sexpr!)
+        {close-var :var} (resolve-var 'rlm.minimal/close-session!)]
+    (let [session (start-var nil {:llm-fn (fn [{:keys [prompt]}]
+                                            (when (= prompt "slow")
+                                              (Thread/sleep 5000))
+                                            (str "ok:" prompt))
+                                  :call-timeout 0.3
+                                  :max-concurrent 4})]
+      (try
+        (let [result (:value (eval-var session
+                               "(llm-query-batched [\"fast\" \"slow\" \"fast2\"])"))]
+          (is (vector? result))
+          (is (= 3 (count result)))
+          (is (str/starts-with? (nth result 0) "ok:fast"))
+          (is (str/includes? (nth result 1) "Error"))
+          (is (str/starts-with? (nth result 2) "ok:fast2")))
+        (finally
+          (close-var session))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'rlm.minimal-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

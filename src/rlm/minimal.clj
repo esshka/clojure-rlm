@@ -2,11 +2,9 @@
   (:require [clojure.pprint :as pprint]
             [clojure.string :as str]
             [clojure.walk :as walk]
+            [rlm.async :as ra]
             [rlm.prompts :as prompts])
   (:import [java.io PrintWriter StringWriter]))
-
-;; ── reserved names ──────────────────────────────────────────
-
 (def reserved-names
   '#{context
      history
@@ -16,9 +14,6 @@
      rlm-query-batched
      final!
      show-vars})
-
-;; ── tool validation ─────────────────────────────────────────
-
 (defn- canonicalize-tool-key [tool-key]
   (symbol (name tool-key)))
 
@@ -41,9 +36,6 @@
       (throw (ex-info "Custom tools must use unique names."
                       {:duplicates (sort duplicates)})))
     (into {} entries)))
-
-;; ── helpers ─────────────────────────────────────────────────
-
 (defn- printable [x]
   (cond
     (string? x) x
@@ -102,13 +94,7 @@
     (map second
          (re-seq #"(?s)```(?:clj|clojure)\s*\n(.*?)```" s))
     []))
-
-;; ── forward declarations ────────────────────────────────────
-
 (declare start-session completion close-session!)
-
-;; ── session helpers ─────────────────────────────────────────
-
 (defn- user-publics [{:keys [ns state]}]
   (let [tool-names (set (keys (:tools @state)))]
     (->> (ns-publics ns)
@@ -124,9 +110,6 @@
   (let [history (:history (swap! state update :history into entries))]
     (alter-var-root (ns-resolve ns 'history) (constantly history))
     history))
-
-;; ── scaffold interning & restoration ────────────────────────
-
 (defn- total-chars
   "Total character count of all message :content values."
   [messages]
@@ -150,21 +133,27 @@
         (fn
           ([prompt] ((var-get (ns-resolve ns-sym 'llm-query)) prompt nil))
           ([prompt model]
-           (let [{:keys [llm-fn depth]} @state]
+           (let [{:keys [llm-fn depth call-timeout]} @state]
              (when-not llm-fn
                (throw (ex-info "No :llm-fn supplied." {})))
              (printable
-              (llm-fn {:prompt (printable prompt)
-                       :messages [{:role "user" :content prompt}]
-                       :model (or model (:model @state))
-                       :depth depth})))))
+              (ra/call-with-timeout
+               #(llm-fn {:prompt (printable prompt)
+                         :messages [{:role "user" :content prompt}]
+                         :model (or model (:model @state))
+                         :depth depth})
+               (some-> call-timeout (* 1000)))))))
 
         llm-query-batched-fn
         (fn
           ([prompts] ((var-get (ns-resolve ns-sym 'llm-query-batched)) prompts nil))
           ([prompts model]
-           (let [lqfn (var-get (ns-resolve ns-sym 'llm-query))]
-             (vec (pmap #(lqfn % model) prompts)))))
+           (let [lqfn (var-get (ns-resolve ns-sym 'llm-query))
+                 {:keys [max-concurrent call-timeout]} @state]
+             (ra/run-batched #(lqfn % model)
+                          prompts
+                          (or max-concurrent 4)
+                          (some-> call-timeout (* 1000))))))
 
         rlm-query-fn
         (fn
@@ -192,8 +181,12 @@
         (fn
           ([prompts] ((var-get (ns-resolve ns-sym 'rlm-query-batched)) prompts nil))
           ([prompts model]
-           (let [rqfn (var-get (ns-resolve ns-sym 'rlm-query))]
-             (vec (pmap #(rqfn % model) prompts)))))
+           (let [rqfn (var-get (ns-resolve ns-sym 'rlm-query))
+                 {:keys [max-concurrent call-timeout]} @state]
+             (ra/run-batched #(rqfn % model)
+                          prompts
+                          (or max-concurrent 4)
+                          (some-> call-timeout (* 1000))))))
 
         scaffold {'context           context
                   'history           (:history @state)
@@ -215,9 +208,6 @@
     (intern ns 'history history)
     (doseq [[sym v] (dissoc scaffold 'context 'history)]
       (intern ns sym v))))
-
-;; ── session lifecycle ───────────────────────────────────────
-
 (defn start-session
   [context opts]
   (let [opts (merge {:max-depth 1
@@ -225,6 +215,8 @@
                      :max-iterations 8
                      :max-timeout nil
                      :max-errors nil
+                     :call-timeout nil
+                     :max-concurrent 4
                      :compaction false
                      :compaction-threshold 100000
                      :system-prompt prompts/default-system-prompt
@@ -244,6 +236,8 @@
                      :max-iterations (:max-iterations opts)
                      :max-timeout (:max-timeout opts)
                      :max-errors (:max-errors opts)
+                     :call-timeout (:call-timeout opts)
+                     :max-concurrent (:max-concurrent opts)
                      :compaction (:compaction opts)
                      :compaction-threshold (:compaction-threshold opts)
                      :llm-fn (:llm-fn opts)
@@ -270,9 +264,6 @@
              (= ns (:ns @state))
              (find-ns ns))
     (remove-ns ns)))
-
-;; ── eval & exec ─────────────────────────────────────────────
-
 (defn eval-sexpr!
   [{:keys [ns state]} form-string]
   (let [start  (now-ms)
@@ -306,9 +297,6 @@
   (let [result (eval-sexpr! session (str "(do\n" code "\n)"))]
     (restore-scaffold! session)
     (assoc result :final (:final @(-> session :state)))))
-
-;; ── message building ────────────────────────────────────────
-
 (defn- initial-messages
   "Build system + context-metadata messages for a session."
   [{:keys [state]}]
@@ -317,9 +305,6 @@
      system-prompt
      (deep-stringify-keys context)
      tools)))
-
-;; ── compaction & default answer ─────────────────────────────
-
 (defn- compact-history
   "Ask the LLM to summarize progress, return a shorter message-history."
   [session system-messages message-history compaction-count]
@@ -359,9 +344,6 @@
               :model (:model @state)
               :depth (:depth @state)
               :prompt (printable (:context @state))}))))
-
-;; ── completion loop ─────────────────────────────────────────
-
 (defn completion
   ([context-or-session]
    (completion context-or-session {}))
@@ -432,49 +414,68 @@
                  user-prompt (prompts/build-user-prompt iteration root-prompt)
                  current-messages (conj (vec message-history) user-prompt)
 
-                 assistant-text (printable
-                                 ((:llm-fn @state)
-                                  {:messages current-messages
-                                   :model (:model @state)
-                                   :depth (:depth @state)
-                                   :prompt (printable (:context @state))}))
-                 code-blocks (extract-code-blocks assistant-text)]
+                 ;; Call LLM with per-call timeout; catch errors outside recur
+                 llm-result (try
+                              {:ok (printable
+                                    (ra/call-with-timeout
+                                     #((:llm-fn @state)
+                                       {:messages current-messages
+                                        :model (:model @state)
+                                        :depth (:depth @state)
+                                        :prompt (printable (:context @state))})
+                                     (some-> (:call-timeout @state) (* 1000))))}
+                              (catch Exception e
+                                {:error (.getMessage e)}))]
 
-             (append-history! session [{:role "assistant" :content assistant-text}])
-
-             (if (seq code-blocks)
-               (let [results (loop [remaining code-blocks
-                                    executed []]
-                               (if (or (empty? remaining) (:final-set? @state))
-                                 executed
-                                 (let [code (first remaining)
-                                       result (exec-code! session code)]
-                                   (recur (rest remaining)
-                                          (conj executed [code result])))))
-                     has-error (boolean (some (fn [[_ r]] (:error r)) results))
-                     new-errors (if has-error (inc consecutive-errors) 0)
-                     iter-ms (reduce + 0 (map (comp :ms second) results))]
-                 (append-history!
-                  session
-                  (mapv (fn [[code result]]
-                          {:role "user"
-                           :content (summarize-result code result)})
-                        results))
+             (if (:error llm-result)
+               ;; LLM call failed (timeout or other) — treat as error iteration
+               (do
+                 (append-history! session [{:role "assistant"
+                                            :content (str "Error: " (:error llm-result))}])
                  (recur (vec (concat system-messages (:history @state)))
                         (inc iteration)
-                        (+ execution-ms iter-ms)
-                        new-errors
-                        assistant-text
+                        execution-ms
+                        (inc consecutive-errors)
+                        last-response
                         compaction-count))
 
-               (recur (vec (concat system-messages (:history @state)))
-                      (inc iteration)
-                      execution-ms
-                      0
-                      assistant-text
-                      compaction-count)))))))))
+               ;; LLM call succeeded — process response
+               (let [assistant-text (:ok llm-result)
+                     code-blocks (extract-code-blocks assistant-text)]
 
-;; ── mock adapter ────────────────────────────────────────────
+                 (append-history! session [{:role "assistant" :content assistant-text}])
+
+                 (if (seq code-blocks)
+                   (let [results (loop [remaining code-blocks
+                                        executed []]
+                                   (if (or (empty? remaining) (:final-set? @state))
+                                     executed
+                                     (let [code (first remaining)
+                                           result (exec-code! session code)]
+                                       (recur (rest remaining)
+                                              (conj executed [code result])))))
+                         has-error (boolean (some (fn [[_ r]] (:error r)) results))
+                         new-errors (if has-error (inc consecutive-errors) 0)
+                         iter-ms (reduce + 0 (map (comp :ms second) results))]
+                     (append-history!
+                      session
+                      (mapv (fn [[code result]]
+                              {:role "user"
+                               :content (summarize-result code result)})
+                            results))
+                     (recur (vec (concat system-messages (:history @state)))
+                            (inc iteration)
+                            (+ execution-ms iter-ms)
+                            new-errors
+                            assistant-text
+                            compaction-count))
+
+                   (recur (vec (concat system-messages (:history @state)))
+                          (inc iteration)
+                          execution-ms
+                          0
+                          assistant-text
+                          compaction-count)))))))))))
 
 (defn mock-llm
   [{:keys [messages]}]
